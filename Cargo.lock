@@ -921,6 +921,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
+name = "hermit-abi"
+version = "0.3.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d231dfb89cfffdbc30e7fc41579ed6066ad03abda9e567ccafae602b97ec5024"
+
+[[package]]
 name = "hex"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1211,6 +1217,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8355be11b20d696c8f18f6cc018c4e372165b1fa8126cef092399c9951984ffa"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.39"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23aa6811d3bd4deb8a84dde645f943476d13b248d818edcf8ce0b2f37f036b44"
+dependencies = [
+ "cc",
+ "libc",
+]
+
+[[package]]
 name = "libsqlite3-sys"
 version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1245,6 +1261,8 @@ dependencies = [
  "itertools",
  "lnx-fs",
  "lnx-tantivy",
+ "mimalloc",
+ "num_cpus",
  "serde",
  "serde_json",
  "time",
@@ -1256,7 +1274,7 @@ dependencies = [
 [[package]]
 name = "lnx-doc"
 version = "0.1.0"
-source = "git+https://github.com/lnx-search/lnx.git?branch=0.10.0-lighting-feature#ebc3711c51c94835ca6cb68c58053382952c3430"
+source = "git+https://github.com/lnx-search/lnx.git?branch=0.10.0-lighting-feature#68edfee7e1022bf58d71287b3cbd67991ba3cfa6"
 dependencies = [
  "ahash 0.8.11",
  "chrono",
@@ -1269,7 +1287,7 @@ dependencies = [
 [[package]]
 name = "lnx-fs"
 version = "0.1.0"
-source = "git+https://github.com/lnx-search/lnx.git?branch=0.10.0-lighting-feature#ebc3711c51c94835ca6cb68c58053382952c3430"
+source = "git+https://github.com/lnx-search/lnx.git?branch=0.10.0-lighting-feature#68edfee7e1022bf58d71287b3cbd67991ba3cfa6"
 dependencies = [
  "ahash 0.8.11",
  "async-trait",
@@ -1297,7 +1315,7 @@ dependencies = [
 [[package]]
 name = "lnx-tantivy"
 version = "0.1.0"
-source = "git+https://github.com/lnx-search/lnx.git?branch=0.10.0-lighting-feature#ebc3711c51c94835ca6cb68c58053382952c3430"
+source = "git+https://github.com/lnx-search/lnx.git?branch=0.10.0-lighting-feature#68edfee7e1022bf58d71287b3cbd67991ba3cfa6"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1385,6 +1403,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mimalloc"
+version = "0.1.43"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68914350ae34959d83f732418d51e2427a794055d0b9529f48259ac07af65633"
+dependencies = [
+ "libmimalloc-sys",
 ]
 
 [[package]]
@@ -1514,6 +1541,16 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
+]
+
+[[package]]
+name = "num_cpus"
+version = "1.16.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4161fcb6d602d4d2081af7c3a45852d875a03dd337a6bfdd6e06407b61342a43"
+dependencies = [
+ "hermit-abi",
+ "libc",
 ]
 
 [[package]]

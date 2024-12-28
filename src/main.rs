@@ -1,12 +1,17 @@
-mod datasets;
 #[cfg(feature = "lnx-tantivy")]
 mod bench_lnx_tantivy;
+mod datasets;
 
 use std::time::Duration;
+
 use anyhow::Result;
 use clap::Parser;
 use tracing::info;
+
 use crate::datasets::Dataset;
+
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Debug, Parser)]
 struct Args {
