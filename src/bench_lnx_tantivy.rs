@@ -1,31 +1,35 @@
+use std::collections::VecDeque;
 use std::mem;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use humansize::DECIMAL;
-use lnx_fs::{BucketConfig, RuntimeOptions, VirtualFileSystem};
+use lnx_fs::{RuntimeOptions, VirtualFileSystem};
+use lnx_tantivy::indexer::SegmentMemory;
 use lnx_tantivy::tantivy::indexer::IndexWriterOptions;
 use lnx_tantivy::tantivy::merge_policy::NoMergePolicy;
 use lnx_tantivy::tantivy::schema::{
+    JsonObjectOptions,
     Schema,
     SchemaBuilder,
+    TextFieldIndexing,
     FAST,
     INDEXED,
     STORED,
     STRING,
     TEXT,
 };
-use lnx_tantivy::tantivy::store::Compressor;
 use lnx_tantivy::tantivy::{Index, IndexSettings};
 use lnx_tantivy::{tantivy, LnxIndex};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::datasets::Dataset;
 
-const NUM_THREADS: usize = 1;
+const NUM_THREADS: usize = 4;
+const MEMORY_LIMIT_PER_SEG: usize = 50 << 20;
+const DOCS_PER_COMMIT: usize = 200_000;
 
 pub fn main(dataset: Dataset) -> Result<()> {
     info!("Starting lnx-tantivy benchmarks");
@@ -33,6 +37,7 @@ pub fn main(dataset: Dataset) -> Result<()> {
     let schema = match dataset {
         Dataset::Movies => movies_schema(),
         Dataset::GHArchive => gharchive_schema(),
+        Dataset::WikipediaAbstract => wikipedia_abstract_schema(),
     };
 
     info!("Dataset schema has {} fields", schema.num_fields());
@@ -60,50 +65,51 @@ fn index_tantivy(schema: Schema, dataset: Dataset) -> Result<()> {
     let index = Index::create_in_dir("./data/lnx_fs_bench/tantivy_run/", schema)?;
     let schema = index.schema();
 
-    let (rx, bytes_read) =
-        crate::datasets::stream_dataset(dataset).context("Read dataset")?;
-    let incoming = parse_objects_to_docs(schema, rx);
+    let schema_clone = schema.clone();
+    let pre_processor = move |record| {
+        let flattened = crate::datasets::flatten_top_level_fields(record);
+        let doc = tantivy::TantivyDocument::from_json_object(&schema_clone, flattened).unwrap();
+        dbg!(doc.len());
+        doc
+    };
+
+    let (rx, bytes_read) = crate::datasets::stream_dataset(dataset, pre_processor)
+        .context("Read dataset")?;
 
     let options = IndexWriterOptions::builder()
         .num_worker_threads(NUM_THREADS)
-        .memory_budget_per_thread(100 << 20)
+        .memory_budget_per_thread(MEMORY_LIMIT_PER_SEG)
         .build();
     let mut writer: tantivy::IndexWriter = index.writer_with_options(options)?;
     writer.set_merge_policy(Box::new(NoMergePolicy));
 
-    let start = Instant::now();
-    let mut execution_time = Duration::default();
     let mut num_docs = 0;
-    for doc in incoming {
+    let mut execute_time = Duration::default();
+    let mut commit_time = Duration::default();
+    let start = Instant::now();
+    for doc in rx {
         let s1 = Instant::now();
         writer.add_document(doc)?;
-        execution_time += s1.elapsed();
+        execute_time += s1.elapsed();
         num_docs += 1;
+
+        if (num_docs % DOCS_PER_COMMIT) == 0 {
+            let s1 = Instant::now();
+            writer.commit()?;
+            commit_time += s1.elapsed();
+        }
     }
-
-    let s2 = Instant::now();
+    let s1 = Instant::now();
     writer.commit()?;
-    let commit_time = s2.elapsed();
+    commit_time += s1.elapsed();
 
-    let elapsed = start.elapsed();
-    let bytes_read = bytes_read.load(Ordering::Relaxed) as f32;
-    let docs_sec = num_docs as f32 / elapsed.as_secs_f32();
-    let bytes_sec = bytes_read / elapsed.as_secs_f32();
-    info!(
-        elapsed = ?elapsed,
-        num_docs = num_docs,
-        docs_per_sec = docs_sec,
-        bytes_read = humansize::format_size(bytes_read as u64, DECIMAL),
-        throughput = humansize::format_size(bytes_sec as u64, DECIMAL),
-        "Completed tantivy indexing",
-    );
-
-    let stall_time = elapsed - execution_time;
-    info!(
-        stall_time = ?stall_time,
-        commit_time = ?commit_time,
-        execution_time = ?execution_time,
-        "Execution breakdown",
+    let total_time = start.elapsed();
+    display_results(
+        total_time,
+        execute_time,
+        commit_time,
+        bytes_read.load(Ordering::Relaxed),
+        num_docs,
     );
 
     Ok(())
@@ -116,149 +122,127 @@ async fn index_lnx_tantivy(schema: Schema, dataset: Dataset) -> Result<()> {
     let rt_options = RuntimeOptions::builder().build();
     let vfs = VirtualFileSystem::mount(path, rt_options).await?;
     let bucket = vfs.create_bucket("dataset").await?;
-    let config = BucketConfig::builder().flush_delay_millis(500).build();
-    bucket.update_config(config).await?;
-    let bucket = vfs.reload_bucket("dataset").await?;
 
     let index = LnxIndex::create("dataset", bucket.clone(), schema).await?;
     let schema = index.schema();
 
-    let (rx, bytes_read) =
-        crate::datasets::stream_dataset(dataset).context("Read dataset")?;
-    let incoming = parse_objects_to_docs(schema, rx);
+    let schema_clone = schema.clone();
+    let pre_processor = move |record| {
+        let flattened = crate::datasets::flatten_top_level_fields(record);
+        tantivy::TantivyDocument::from_json_object(&schema_clone, flattened).unwrap()
+    };
+    let (rx, bytes_read) = crate::datasets::stream_dataset(dataset, pre_processor)
+        .context("Read dataset")?;
 
-    let (segments_tx, segments_rx) = flume::unbounded();
-    let thread_total_time = Arc::new(AtomicU64::default());
-    let indexing_time = Arc::new(AtomicU64::default());
-    let finish_time = Arc::new(AtomicU64::default());
+    let (segments_tx, segments_rx) = flume::bounded(4);
     for _ in 0..NUM_THREADS {
-        let incoming = incoming.clone();
-        let index = index.clone();
-        let segments_tx = segments_tx.clone();
-        let thread_total_time = thread_total_time.clone();
-        let indexing_time = indexing_time.clone();
-        let finish_time = finish_time.clone();
-
-        std::thread::spawn(move || {
-            const BLOCK_SIZE: u64 = 250_000;
-
-            let settings = IndexSettings {
-                docstore_compression: Compressor::Lz4,
-                docstore_compress_dedicated_thread: true,
-                docstore_blocksize: 30 << 10,
-            };
-
-            let start = Instant::now();
-
-            let mut indexer = index.new_indexer_with_settings(settings.clone());
-            let mut num_docs = 0;
-            for doc in incoming {
-                let s1 = Instant::now();
-                indexer.add_document(doc)?;
-                indexing_time
-                    .fetch_add(s1.elapsed().as_micros() as u64, Ordering::Relaxed);
-
-                num_docs += 1;
-
-                if num_docs >= BLOCK_SIZE {
-                    let new_indexer = index.new_indexer_with_settings(settings.clone());
-                    let old_indexer = mem::replace(&mut indexer, new_indexer);
-
-                    let s2 = Instant::now();
-                    let segment = old_indexer.finish()?;
-                    finish_time
-                        .fetch_add(s2.elapsed().as_micros() as u64, Ordering::Relaxed);
-
-                    segments_tx.send(segment)?;
-                    num_docs = 0;
-                }
-            }
-
-            let s2 = Instant::now();
-            let segment = indexer.finish()?;
-            finish_time.fetch_add(s2.elapsed().as_micros() as u64, Ordering::Relaxed);
-
-            segments_tx.send(segment)?;
-
-            let elapsed = start.elapsed();
-            thread_total_time.fetch_add(elapsed.as_micros() as u64, Ordering::Relaxed);
-
-            Ok::<_, anyhow::Error>(())
-        });
+        spawn_lnx_indexing_worker(index.clone(), rx.clone(), segments_tx.clone());
     }
     drop(segments_tx);
 
-    let start = Instant::now();
-    let mut commit_time = Duration::default();
     let mut num_docs = 0;
-    for segment in segments_rx {
-        num_docs += segment.num_docs();
-
-        let s1 = Instant::now();
-        index.add_segment(segment).await?;
-        commit_time += s1.elapsed();
+    let mut commit_time = Duration::default();
+    let mut handles = VecDeque::new();
+    let start = Instant::now();
+    for seg in segments_rx {
+        num_docs += seg.num_docs();
+        let index = index.clone();
+        let handle = tokio::spawn(async move {
+            index.add_segment(seg).await
+        });
+        
+        handles.push_back(handle);
+        
+        if handles.len() > 16 {
+            let s1 = Instant::now();
+            if let Some(handle) = handles.pop_front() {
+                handle.await??;
+            }
+            commit_time += s1.elapsed();
+        }
     }
 
-    let elapsed = start.elapsed();
-    let bytes_read = bytes_read.load(Ordering::Relaxed) as f32;
-    let docs_sec = num_docs as f32 / elapsed.as_secs_f32();
-    let bytes_sec = bytes_read / elapsed.as_secs_f32();
-    info!(
-        elapsed = ?elapsed,
-        num_docs = num_docs,
-        docs_per_sec = docs_sec,
-        bytes_read = humansize::format_size(bytes_read as u64, DECIMAL),
-        throughput = humansize::format_size(bytes_sec as u64, DECIMAL),
-        "Completed lnx indexing",
-    );
-
-    let execution_time = elapsed - commit_time;
-    let thread_total = Duration::from_micros(
-        (thread_total_time.load(Ordering::Relaxed) as f64 / NUM_THREADS as f64) as u64,
-    );
-    let indexing_time = Duration::from_micros(
-        (indexing_time.load(Ordering::Relaxed) as f64 / NUM_THREADS as f64) as u64,
-    );
-    let finish_time = Duration::from_micros(
-        (finish_time.load(Ordering::Relaxed) as f64 / NUM_THREADS as f64) as u64,
-    );
-    let stall_time = thread_total - (indexing_time + finish_time);
-    info!(
-        thread_total = ?thread_total,
-        indexing_time = ?indexing_time,
-        finish_time = ?finish_time,
-        stall_time = ?stall_time,
-        execution_time = ?execution_time,
-        commit_time = ?commit_time,
-        "Execution breakdown",
+    let s1 = Instant::now();
+    for handle in handles {
+        handle.await??;        
+    }
+    commit_time += s1.elapsed();
+    
+    let total_time = start.elapsed();
+    display_results(
+        total_time,
+        Duration::default(),
+        commit_time,
+        bytes_read.load(Ordering::Relaxed),
+        num_docs,
     );
 
     Ok(())
 }
 
-fn parse_objects_to_docs(
-    schema: Schema,
-    documents_rx: flume::Receiver<serde_json::Map<String, serde_json::Value>>,
-) -> flume::Receiver<tantivy::TantivyDocument> {
-    let (finished_tx, incoming) = flume::bounded(10000);
-    for _ in 0..6 {
-        let rx = documents_rx.clone();
-        let finished_tx = finished_tx.clone();
-        let schema = schema.clone();
-        std::thread::spawn(move || {
-            let incoming = rx
-                .into_iter()
-                .map(crate::datasets::flatten_top_level_fields);
+fn spawn_lnx_indexing_worker(
+    index: LnxIndex,
+    incoming: flume::Receiver<tantivy::TantivyDocument>,
+    finished_segments: flume::Sender<SegmentMemory>,
+) {
+    let runner = move || {
+        let mut indexer = index.new_indexer_with_settings(IndexSettings::default());
 
-            for record in incoming {
-                let doc = tantivy::TantivyDocument::from_json_object(&schema, record)?;
-                let _ = finished_tx.send(doc);
+        let mut num_docs = 0;
+        for doc in incoming {
+            indexer.add_document(doc)?;
+            num_docs += 1;
+
+            if indexer.memory_usage() >= MEMORY_LIMIT_PER_SEG
+                || (num_docs % (DOCS_PER_COMMIT / NUM_THREADS)) == 0
+            {
+                let new_indexer =
+                    index.new_indexer_with_settings(IndexSettings::default());
+                let old_indexer = mem::replace(&mut indexer, new_indexer);
+                let segment = old_indexer.finish()?;
+                finished_segments.send(segment)?;
             }
-            Ok::<_, anyhow::Error>(())
-        });
-    }
-    drop(finished_tx);
-    incoming
+        }
+
+        let segment = indexer.finish()?;
+        finished_segments.send(segment)?;
+
+        Ok::<_, anyhow::Error>(())
+    };
+
+    let wrapped = move || {
+        if let Err(e) = runner() {
+            error!(error = ?e, "Failed to run indexer");
+        }
+    };
+
+    std::thread::spawn(wrapped);
+}
+
+fn display_results(
+    total_time: Duration,
+    true_time: Duration,
+    commit_time: Duration,
+    bytes_read: usize,
+    total_docs: usize,
+) {
+    let stall_time = total_time - (true_time + commit_time);
+    let bytes_sec = bytes_read as f32 / total_time.as_secs_f32();
+    let docs_sec = total_docs as f32 / total_time.as_secs_f32();
+
+    let formatted_bytes_sec =
+        format!("{}/s", humansize::format_size(bytes_sec as u64, DECIMAL));
+    let formatted_docs_sec = format!("{docs_sec}/s");
+
+    info!(
+        total_time = ?total_time,
+        execution_time = ?true_time,
+        commit_time = ?commit_time,
+        stall_time = ?stall_time,
+        bytes_rate = %formatted_bytes_sec,
+        docs_rate = %formatted_docs_sec,
+        "Finished indexing run"
+    );
 }
 
 fn movies_schema() -> Schema {
@@ -269,6 +253,21 @@ fn movies_schema() -> Schema {
     schema_builder.add_text_field("poster", STORED);
     schema_builder.add_text_field("genres", TEXT | FAST | STORED);
     schema_builder.add_i64_field("release_date", FAST | STORED);
+    schema_builder.build()
+}
+
+fn wikipedia_abstract_schema() -> Schema {
+    let mut schema_builder = SchemaBuilder::new();
+    schema_builder.add_text_field("title", TEXT | STORED);
+    schema_builder.add_text_field("url", STORED);
+    schema_builder.add_text_field("abstract", TEXT | STORED);
+    schema_builder.add_json_field(
+        "links.sublink",
+        JsonObjectOptions::default()
+            .set_stored()
+            .set_fast(Some("raw"))
+            .set_indexing_options(TextFieldIndexing::default().set_tokenizer("raw")),
+    );
     schema_builder.build()
 }
 

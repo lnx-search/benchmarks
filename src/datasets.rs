@@ -18,6 +18,8 @@ pub enum Dataset {
     Movies,
     /// A sample of the GHArchive dataset ~1.4GB
     GHArchive,
+    /// Wikipedia abstract dataset ~6GB lots of indexable text.
+    WikipediaAbstract,
 }
 
 impl FromStr for Dataset {
@@ -28,6 +30,7 @@ impl FromStr for Dataset {
         match s.as_str() {
             "movies" => Ok(Self::Movies),
             "gharchive" => Ok(Self::GHArchive),
+            "wikiabstract" => Ok(Self::WikipediaAbstract),
             other => Err(format!("Unknown dataset: {other:?}")),
         }
     }
@@ -39,6 +42,9 @@ impl Dataset {
         match self {
             Dataset::Movies => "./datasets/movies.json",
             Dataset::GHArchive => "./datasets/gharchive/*.json",
+            Dataset::WikipediaAbstract => {
+                "./datasets/enwiki-2024-09-20-abstract/*.ndjson"
+            },
         }
     }
 
@@ -46,30 +52,34 @@ impl Dataset {
         match self {
             Dataset::Movies => 1,
             Dataset::GHArchive => 8,
+            Dataset::WikipediaAbstract => 8,
         }
     }
 }
 
 #[allow(unused)]
 /// Creates a new stream of document to ingest.
-pub fn stream_dataset(
+pub fn stream_dataset<PP, T>(
     dataset: Dataset,
-) -> Result<(
-    flume::Receiver<serde_json::Map<String, Value>>,
-    Arc<AtomicUsize>,
-)> {
+    pre_processor: PP,
+) -> Result<(flume::Receiver<T>, Arc<AtomicUsize>)>
+where
+    PP: Fn(serde_json::Map<String, Value>) -> T + Send + Clone + 'static,
+    T: Send + 'static,
+{
     let path = dataset.file_glob();
     let glob = glob::glob(path)?;
 
-    let (tx, rx) = flume::bounded(10000);
+    let (tx, rx) = flume::bounded(1_000_000);
     let total_bytes_read = Arc::new(AtomicUsize::default());
     for chunk in &glob.chunks(dataset.reader_concurrency()) {
         let chunk = chunk.collect::<Result<Vec<PathBuf>, _>>()?;
         let tx = tx.clone();
         let total_bytes_read = total_bytes_read.clone();
+        let pre_processor = pre_processor.clone();
         std::thread::spawn(move || {
             for file in chunk {
-                match read_file(file, dataset, tx.clone()) {
+                match read_file(file, dataset, tx.clone(), pre_processor.clone()) {
                     Ok(read) => {
                         total_bytes_read.fetch_add(read, Ordering::Relaxed);
                     },
@@ -84,13 +94,18 @@ pub fn stream_dataset(
     Ok((rx, total_bytes_read))
 }
 
-#[instrument("ingest", skip(tx))]
-fn read_file(
+#[instrument("ingest", skip(tx, pre_processor))]
+fn read_file<PP, T>(
     path: PathBuf,
     dataset: Dataset,
-    tx: flume::Sender<serde_json::Map<String, Value>>,
-) -> Result<usize> {
-    let reader = BufReader::new(File::open(path)?);
+    tx: flume::Sender<T>,
+    pre_processor: PP,
+) -> Result<usize>
+where
+    PP: Fn(serde_json::Map<String, Value>) -> T + Send + Clone + 'static,
+    T: Send + 'static,
+{
+    let reader = BufReader::with_capacity(100 << 20, File::open(path)?);
 
     let mut bytes_read = 0;
     match dataset {
@@ -98,34 +113,52 @@ fn read_file(
             let movies: Vec<serde_json::Map<String, Value>> =
                 serde_json::from_reader(reader)?;
             for record in movies {
-                let _ = tx.send(record);
+                let _ = tx.send(pre_processor(record));
             }
         },
         Dataset::GHArchive => {
-            let mut count = 0;
-            let mut skipped = 0;
-            for line in reader.lines() {
-                let line = line?;
-                let record = match serde_json::from_str::<serde_json::Map<String, Value>>(
-                    &line,
-                ) {
-                    Err(_) => {
-                        skipped += 1;
-                        continue;
-                    },
-                    Ok(record) => record,
-                };
-
-                count += 1;
-                bytes_read += line.as_bytes().len();
-                let _ = tx.send(record);
-            }
-
-            debug!(records = count, skipped = skipped, "Processed ingest file");
+            stream_ndjson(reader, &mut bytes_read, tx, pre_processor)?;
+        },
+        Dataset::WikipediaAbstract => {
+            stream_ndjson(reader, &mut bytes_read, tx, pre_processor)?;
         },
     }
 
     Ok(bytes_read)
+}
+
+fn stream_ndjson<PP, T>(
+    reader: BufReader<File>,
+    bytes_read: &mut usize,
+    tx: flume::Sender<T>,
+    pre_processor: PP,
+) -> Result<()>
+where
+    PP: Fn(serde_json::Map<String, Value>) -> T + Send + Clone + 'static,
+    T: Send + 'static,
+{
+    let mut count = 0;
+    let mut skipped = 0;
+    for line in reader.lines() {
+        let line = line?;
+        let record = match serde_json::from_str::<serde_json::Map<String, Value>>(&line)
+        {
+            Err(_) => {
+                skipped += 1;
+                continue;
+            },
+            Ok(record) => record,
+        };
+
+        count += 1;
+        *bytes_read += line.as_bytes().len();
+
+        let _ = tx.send(pre_processor(record));
+    }
+
+    debug!(records = count, skipped = skipped, "Processed ingest file");
+
+    Ok(())
 }
 
 /// Flattens the top level fields until it gets to a single value or array.

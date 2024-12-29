@@ -1263,6 +1263,7 @@ dependencies = [
  "lnx-tantivy",
  "mimalloc",
  "num_cpus",
+ "quick-xml",
  "serde",
  "serde_json",
  "time",
@@ -1274,7 +1275,7 @@ dependencies = [
 [[package]]
 name = "lnx-doc"
 version = "0.1.0"
-source = "git+https://github.com/lnx-search/lnx.git?branch=0.10.0-lighting-feature#68edfee7e1022bf58d71287b3cbd67991ba3cfa6"
+source = "git+https://github.com/lnx-search/lnx.git?branch=0.10.0-lighting-feature#9c7ab984c242b314195e4260e177db749e25f621"
 dependencies = [
  "ahash 0.8.11",
  "chrono",
@@ -1287,7 +1288,7 @@ dependencies = [
 [[package]]
 name = "lnx-fs"
 version = "0.1.0"
-source = "git+https://github.com/lnx-search/lnx.git?branch=0.10.0-lighting-feature#68edfee7e1022bf58d71287b3cbd67991ba3cfa6"
+source = "git+https://github.com/lnx-search/lnx.git?branch=0.10.0-lighting-feature#9c7ab984c242b314195e4260e177db749e25f621"
 dependencies = [
  "ahash 0.8.11",
  "async-trait",
@@ -1315,7 +1316,7 @@ dependencies = [
 [[package]]
 name = "lnx-tantivy"
 version = "0.1.0"
-source = "git+https://github.com/lnx-search/lnx.git?branch=0.10.0-lighting-feature#68edfee7e1022bf58d71287b3cbd67991ba3cfa6"
+source = "git+https://github.com/lnx-search/lnx.git?branch=0.10.0-lighting-feature#9c7ab984c242b314195e4260e177db749e25f621"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1740,6 +1741,16 @@ dependencies = [
  "wasi",
  "web-sys",
  "winapi",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.37.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f22f29bdff3987b4d8632ef95fd6424ec7e4e0a57e2f4fc63e489e75357f6a03"
+dependencies = [
+ "memchr",
+ "serde",
 ]
 
 [[package]]

@@ -1,6 +1,8 @@
 #[cfg(feature = "lnx-tantivy")]
 mod bench_lnx_tantivy;
 mod datasets;
+#[cfg(feature = "prep-datasets")]
+mod prep_datasets;
 
 use std::time::Duration;
 
@@ -23,10 +25,15 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info,tantivy=warn,lnx_fs=warn,lnx_tantivy=warn");
+        std::env::set_var("RUST_LOG", "info,tantivy=warn,lnx_tantivy=warn");
     }
 
     tracing_subscriber::fmt::init();
+
+    #[cfg(feature = "prep-datasets")]
+    {
+        prep_datasets::main()?;
+    }
 
     info!("running lnx benchmarks");
 
